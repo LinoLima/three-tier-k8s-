@@ -1,0 +1,183 @@
+# =============================================================
+# .github/workflows/frontend-cicd.yml
+#
+# Frontend CI/CD — Build → Push to ECR → Rolling update on EKS
+#
+# Triggers:
+#   • Push to main branch
+#   • Pull request targeting main
+#
+# Secrets required (set in GitHub → Settings → Secrets):
+#   AWS_ROLE_ARN          → IAM role to assume via OIDC (no keys needed)
+#   AWS_REGION            → e.g. us-east-1
+#   ECR_REPOSITORY        → e.g. 740525964121.dkr.ecr.us-east-1.amazonaws.com/three-tier-k8s-frontend
+#   EKS_CLUSTER_NAME      → e.g. three-tier-k8s-eks
+# =============================================================
+
+name: Frontend CI/CD
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "frontend/**"
+      - ".github/workflows/frontend-cicd.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "frontend/**"
+      - ".github/workflows/frontend-cicd.yml"
+
+# Cancel in-progress runs on the same branch when a new push comes in.
+# Prevents two deploys racing each other.
+concurrency:
+  group: frontend-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+  EKS_CLUSTER_NAME: ${{ secrets.EKS_CLUSTER_NAME }}
+  DEPLOYMENT_NAME: frontend
+  CONTAINER_NAME: frontend
+  K8S_NAMESPACE: three-tier
+
+jobs:
+  # -----------------------------------------------------------
+  # JOB: build-and-deploy
+  # Runs on every push to main AND every PR targeting main.
+  # On PRs: builds and pushes image but skips the deploy step.
+  # On main: full build + push + rolling update.
+  # -----------------------------------------------------------
+  build-and-deploy:
+    name: Build, Push, Deploy
+    runs-on: ubuntu-latest
+
+    # Required for AWS OIDC authentication (no long-lived keys)
+    permissions:
+      id-token: write # Allows the runner to request an OIDC token
+      contents: read # Allows reading the repository
+
+    steps:
+      # ---------------------------------------------------------
+      # 1. Checkout source code
+      # ---------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------
+      # 2. Authenticate with AWS via OIDC
+      #    No AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY needed.
+      #    GitHub requests a short-lived OIDC token, exchanges it
+      #    for temporary AWS credentials by assuming AWS_ROLE_ARN.
+      #    Credentials expire after 1 hour automatically.
+      # ---------------------------------------------------------
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-frontend-${{ github.run_id }}
+
+      # ---------------------------------------------------------
+      # 3. Log in to Amazon ECR
+      #    Uses the temporary credentials from step 2 to get a
+      #    docker login token valid for 12 hours.
+      # ---------------------------------------------------------
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ---------------------------------------------------------
+      # 4. Compute image tag
+      #    Tag = short Git SHA (first 7 chars of commit hash).
+      #    Why not "latest"?
+      #      - "latest" is mutable — you can't tell which code
+      #        is actually running just by looking at the tag.
+      #      - SHA tags are immutable and traceable.
+      #      - Rollback = deploy the previous SHA tag.
+      #    We ALSO push "latest" as a convenience alias.
+      # ---------------------------------------------------------
+      - name: Set image tag
+        id: tag
+        run: echo "IMAGE_TAG=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      # ---------------------------------------------------------
+      # 5. Set up Docker Buildx
+      #    Enables BuildKit for faster, more efficient builds
+      #    and --platform flag support (linux/amd64 for EKS).
+      # ---------------------------------------------------------
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ---------------------------------------------------------
+      # 6. Build and push Docker image to ECR
+      #    - Builds for linux/amd64 (EKS node architecture)
+      #    - Pushes two tags: the SHA tag and "latest"
+      #    - Uses layer caching (cache-from/cache-to) to speed
+      #      up builds — unchanged layers are reused from the
+      #      previous push stored in ECR
+      # ---------------------------------------------------------
+      - name: Build and push image to ECR
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.IMAGE_TAG }}
+            ${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=registry,ref=${{ env.ECR_REPOSITORY }}:latest
+          cache-to: type=inline
+
+      # ---------------------------------------------------------
+      # 7. Configure kubectl
+      #    Updates ~/.kube/config to point at the EKS cluster.
+      #    Uses the same temporary AWS credentials from step 2.
+      #    Only runs on push to main (not on PRs).
+      # ---------------------------------------------------------
+      - name: Configure kubectl
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name   ${{ env.EKS_CLUSTER_NAME }}
+
+      # ---------------------------------------------------------
+      # 8. Rolling update — update image in the Deployment
+      #    kubectl set image triggers a rolling update:
+      #      - K8s creates new pods with the new image
+      #      - Waits for them to pass readiness probes
+      #      - Only then terminates old pods
+      #      - Never takes all pods down at once (zero downtime)
+      #
+      #    kubectl rollout status waits until the rollout is
+      #    complete (all new pods healthy) before the job
+      #    succeeds. If a pod crashes, this step fails and
+      #    GitHub marks the workflow as failed.
+      #    Only runs on push to main (not on PRs).
+      # ---------------------------------------------------------
+      - name: Deploy to EKS (rolling update)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          kubectl set image deployment/${{ env.DEPLOYMENT_NAME }} \
+            ${{ env.CONTAINER_NAME }}=${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.IMAGE_TAG }} \
+            --namespace ${{ env.K8S_NAMESPACE }}
+
+          kubectl rollout status deployment/${{ env.DEPLOYMENT_NAME }} \
+            --namespace ${{ env.K8S_NAMESPACE }} \
+            --timeout=300s
+
+      # ---------------------------------------------------------
+      # 9. Print summary
+      # ---------------------------------------------------------
+      - name: Deployment summary
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          echo "Deployed image: ${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.IMAGE_TAG }}"
+          echo "Cluster: ${{ env.EKS_CLUSTER_NAME }}"
+          echo "Namespace: ${{ env.K8S_NAMESPACE }}"
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }} -l app=frontend
