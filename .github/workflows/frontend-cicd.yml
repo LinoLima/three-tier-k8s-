@@ -103,3 +103,4 @@ jobs:
           echo "✅ Deployed: ${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.IMAGE_TAG }}"
           kubectl get pods -n ${{ env.K8S_NAMESPACE }} -l app=frontend
 # trigger
+# fix rbac
